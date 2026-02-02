@@ -9,15 +9,18 @@ import zipfile
 import subprocess
 import shutil
 import argparse
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 from datetime import datetime
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
+import pystray
+from PIL import Image
 
 # --- CONSTANTS ---
-VERSION = "1.0.3"
+VERSION = "1.0.7"
 APP_NAME = "saveSync"
 APP_DATA_DIR = Path(os.getenv('APPDATA')) / APP_NAME
 GAMES_DIR = APP_DATA_DIR / "games"
@@ -131,12 +134,24 @@ def get_drive():
     gauth = GoogleAuth(settings=settings)
     gauth.LoadCredentialsFile(str(CREDENTIALS_FILE))
     
-    if gauth.credentials is None:
-        gauth.LocalWebserverAuth()
-    elif gauth.access_token_expired:
-        gauth.Refresh()
-    else:
-        gauth.Authorize()
+    try:
+        if gauth.credentials is None:
+            gauth.LocalWebserverAuth()
+        elif gauth.access_token_expired:
+            gauth.Refresh()
+        else:
+            gauth.Authorize()
+    except Exception as e:
+        # Token refresh/auth failed (expired/revoked) - delete credentials and re-auth
+        error_msg = str(e).lower()
+        if 'invalid_grant' in error_msg or 'token' in error_msg or 'expired' in error_msg or 'revoked' in error_msg:
+            print("⚠️ Access token expired or revoked. Re-authenticating...")
+            if CREDENTIALS_FILE.exists():
+                CREDENTIALS_FILE.unlink()
+            gauth = GoogleAuth(settings=settings)
+            gauth.LocalWebserverAuth()
+        else:
+            raise
     
     gauth.SaveCredentialsFile(str(CREDENTIALS_FILE))
     return GoogleDrive(gauth)
@@ -513,7 +528,7 @@ class SettingsDialog(tk.Toplevel):
             variable=self.show_log_var
         )
         log_check.pack(anchor='w')
-        ToolTip(log_check, "When enabled, shows a progress window when syncing via desktop shortcuts")
+        ToolTip(log_check, "When enabled, shows window on startup. When disabled, starts minimized to system tray. Minimize window anytime to hide to tray.")
         
         # Default GDrive Folder
         gdrive_frame = ttk.Frame(settings_frame)
@@ -1045,25 +1060,40 @@ class SaveSyncApp(tk.Tk):
 # CLI MODE
 # ============================================================
 
-def run_cli_with_gui_window(game_id, sync_only=False):
-    """Run CLI mode with a GUI log window."""
+def run_cli_with_gui_window(game_id, sync_only=False, start_minimized=False):
+    """Run CLI mode with a GUI log window and system tray support."""
     root = tk.Tk()
     root.title(f"SaveSync - {game_id}")
     root.geometry("550x350")
     
-    # Set window icon
+    # Variables to track state
+    tray_icon = None
+    is_visible = not start_minimized
+    sync_complete = False
+    
+    # Load icon for both window and tray
+    icon_image = None
     try:
         if getattr(sys, 'frozen', False):
             icon_path = Path(sys._MEIPASS) / "icon.png"
+            ico_path = Path(sys._MEIPASS) / "icon.ico"
         else:
             icon_path = Path(__file__).parent / "icon.png"
+            ico_path = Path(__file__).parent / "icon.ico"
         
         if icon_path.exists():
-            icon = tk.PhotoImage(file=str(icon_path))
-            root.iconphoto(True, icon)
-            root._icon = icon  # Keep reference
+            tk_icon = tk.PhotoImage(file=str(icon_path))
+            root.iconphoto(True, tk_icon)
+            root._icon = tk_icon  # Keep reference
+            icon_image = Image.open(str(icon_path))
+        elif ico_path.exists():
+            icon_image = Image.open(str(ico_path))
     except Exception:
         pass
+    
+    # Create a default icon if none loaded
+    if icon_image is None:
+        icon_image = Image.new('RGB', (64, 64), color='#4a90d9')
     
     # Center window
     root.update_idletasks()
@@ -1079,29 +1109,146 @@ def run_cli_with_gui_window(game_id, sync_only=False):
         text.insert(tk.END, msg + '\n')
         text.see(tk.END)
         text.configure(state='disabled')
-        root.update()
+        try:
+            root.update()
+        except tk.TclError:
+            pass  # Window may be destroyed
+    
+    def show_window():
+        """Show the window from tray."""
+        nonlocal is_visible
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+        is_visible = True
+    
+    def hide_to_tray():
+        """Hide window to system tray."""
+        nonlocal is_visible
+        root.withdraw()
+        is_visible = False
+    
+    def quit_app():
+        """Quit the application."""
+        nonlocal tray_icon
+        if tray_icon:
+            tray_icon.stop()
+        root.quit()
+        root.destroy()
+    
+    def on_tray_click(icon, item):
+        """Handle tray icon click."""
+        root.after(0, show_window)
+    
+    def on_minimize(event):
+        """Handle window minimize - hide to tray instead."""
+        if root.state() == 'iconic':
+            root.after(10, hide_to_tray)
+    
+    # Create system tray icon
+    tray_menu = pystray.Menu(
+        pystray.MenuItem("Show", on_tray_click, default=True),
+        pystray.MenuItem("Quit", lambda icon, item: root.after(0, quit_app))
+    )
+    
+    tray_icon = pystray.Icon(
+        "SaveSync",
+        icon_image.resize((64, 64)),
+        f"SaveSync - {game_id}",
+        tray_menu
+    )
+    
+    # Run tray icon in separate thread
+    def run_tray():
+        tray_icon.run()
+    
+    tray_thread = threading.Thread(target=run_tray, daemon=True)
+    tray_thread.start()
+    
+    # Bind minimize event
+    root.bind('<Unmap>', on_minimize)
+    
+    # Handle window close button
+    def on_close():
+        if sync_complete:
+            quit_app()
+        else:
+            hide_to_tray()
+    
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    
+    # Thread-safe variables for conflict dialog
+    conflict_event = threading.Event()
+    conflict_result = [None]  # Use list to allow modification from nested function
+    conflict_data = [None, None]  # local_time, cloud_time
+    
+    def check_conflict_request():
+        """Check if background thread needs conflict dialog (runs on main thread)."""
+        if conflict_data[0] is not None:
+            local_time, cloud_time = conflict_data
+            conflict_data[0] = None
+            conflict_data[1] = None
+            
+            # Make sure window is visible for conflict dialog
+            show_window()
+            dialog = ConflictDialog(root, local_time, cloud_time)
+            root.wait_window(dialog)
+            conflict_result[0] = dialog.result or 'cancel'
+            conflict_event.set()
+        
+        # Keep checking while sync is running
+        if not sync_complete:
+            root.after(100, check_conflict_request)
     
     def gui_conflict_callback(local_time, cloud_time):
-        """GUI callback for conflict resolution."""
-        dialog = ConflictDialog(root, local_time, cloud_time)
-        root.wait_window(dialog)
-        return dialog.result or 'cancel'
+        """GUI callback for conflict resolution (called from background thread)."""
+        conflict_event.clear()
+        conflict_data[0] = local_time
+        conflict_data[1] = cloud_time
+        # Wait for main thread to handle the dialog
+        conflict_event.wait()
+        return conflict_result[0]
+    
+    def thread_safe_log(msg):
+        """Log message in a thread-safe way."""
+        root.after(0, lambda: log(msg))
     
     def run_sync():
+        nonlocal sync_complete
         try:
-            log(f"SaveSync - Syncing: {game_id}")
-            log("=" * 40)
-            result = sync_game(game_id, run_game=not sync_only, log_func=log, conflict_callback=gui_conflict_callback)
+            thread_safe_log(f"SaveSync - Syncing: {game_id}")
+            thread_safe_log("=" * 40)
+            result = sync_game(game_id, run_game=not sync_only, log_func=thread_safe_log, conflict_callback=gui_conflict_callback)
             if result:
-                log("\n✅ Done!")
+                thread_safe_log("\n✅ Done!")
         except Exception as e:
-            log(f"\n❌ Error: {e}")
+            thread_safe_log(f"\n❌ Error: {e}")
         
-        # Add close button after sync completes
-        ttk.Button(root, text="Close", command=root.destroy).pack(pady=10)
+        sync_complete = True
+        # Add close button after sync completes (on main thread)
+        root.after(0, lambda: ttk.Button(root, text="Close", command=quit_app).pack(pady=10))
+        
+        # Show window when sync is complete (so user can see the result)
+        root.after(0, show_window)
     
-    root.after(100, run_sync)
+    # Start minimized if requested
+    if start_minimized:
+        root.withdraw()
+    
+    # Start conflict dialog checker
+    root.after(100, check_conflict_request)
+    
+    # Run sync in background thread
+    sync_thread = threading.Thread(target=run_sync, daemon=True)
+    sync_thread.start()
     root.mainloop()
+    
+    # Cleanup tray icon
+    if tray_icon:
+        try:
+            tray_icon.stop()
+        except Exception:
+            pass
 
 
 def cli_mode(game_id):
@@ -1130,21 +1277,11 @@ def main():
     ensure_app_dirs()
     
     if args.game:
-        # CLI mode - check if GUI log window is enabled in settings
+        # CLI mode - always use tray-enabled window
+        # Setting controls whether window starts visible or minimized
         settings = load_settings()
-        if settings.get('show_log_window', True):
-            run_cli_with_gui_window(args.game, sync_only=args.sync_only)
-        else:
-            # Silent mode - just run sync
-            try:
-                sync_game(args.game, run_game=not args.sync_only)
-            except Exception as e:
-                # Show error dialog since console is hidden
-                root = tk.Tk()
-                root.withdraw()
-                messagebox.showerror("SaveSync Error", str(e))
-                root.destroy()
-                sys.exit(1)
+        start_minimized = not settings.get('show_log_window', True)
+        run_cli_with_gui_window(args.game, sync_only=args.sync_only, start_minimized=start_minimized)
     else:
         # GUI mode
         app = SaveSyncApp()
