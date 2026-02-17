@@ -5,6 +5,15 @@
 Sync your game saves to Google Drive automatically.
 Download saves before playing, upload after closing.
 
+# Instalation and usage
+- Get the latest release from the github Releases
+- On the app, add your google client credentials generated in the google console
+- Configure a game + create a shortcut that auto runs the app and the game
+- Enjoy savefiles synced across PCs :)
+
+
+## DEV
+
 -------------------------------------------
 REQUIREMENTS
 -------------------------------------------
