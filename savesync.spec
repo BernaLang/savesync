@@ -36,10 +36,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
-    name=f'SaveSync_v{VERSION}',  # Version in filename
+    exclude_binaries=True,
+    name='SaveSync',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -53,4 +52,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='icon.ico',  # Custom app icon (Windows requires .ico format)
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name=f'SaveSync_v{VERSION}',
 )

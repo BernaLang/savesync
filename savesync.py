@@ -14,13 +14,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 from datetime import datetime
-from pydrive2.auth import GoogleAuth
-from pydrive2.drive import GoogleDrive
-import pystray
-from PIL import Image
+# Heavy imports (pydrive2, pystray, PIL) are lazy-loaded inside
+# get_drive() and run_cli_with_gui_window() for faster startup.
 
 # --- CONSTANTS ---
-VERSION = "1.0.7"
+VERSION = "1.1.0"
 APP_NAME = "saveSync"
 APP_DATA_DIR = Path(os.getenv('APPDATA')) / APP_NAME
 GAMES_DIR = APP_DATA_DIR / "games"
@@ -117,6 +115,9 @@ def list_games():
 
 def get_drive():
     """Handles Google OAuth authentication."""
+    from pydrive2.auth import GoogleAuth
+    from pydrive2.drive import GoogleDrive
+
     client_secrets = load_client_secrets()
     if not client_secrets:
         raise Exception("Client secrets not configured. Please run the GUI to set up.")
@@ -955,6 +956,16 @@ class SaveSyncApp(tk.Tk):
         sync_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(sync_btn, "Sync saves without launching game")
         
+        upload_btn = ttk.Button(btn_frame, text="⬆", width=3,
+                                command=lambda g=game: self._force_upload(g))
+        upload_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(upload_btn, "Force upload local saves to cloud")
+        
+        download_btn = ttk.Button(btn_frame, text="⬇", width=3,
+                                  command=lambda g=game: self._force_download(g))
+        download_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(download_btn, "Force download cloud saves to local")
+        
         edit_btn = ttk.Button(btn_frame, text="✏", width=3,
                               command=lambda g=game: self._edit_game(g))
         edit_btn.pack(side=tk.LEFT, padx=2)
@@ -1014,6 +1025,16 @@ class SaveSyncApp(tk.Tk):
         """Sync a game without launching."""
         self._run_sync_window(game['id'], run_game=False)
     
+    def _force_upload(self, game):
+        """Force upload local saves to cloud."""
+        if messagebox.askyesno("Force Upload", f"Upload local saves for '{game['name']}' to cloud?\n\nThis will overwrite the cloud save."):
+            self._run_force_sync_window(game, mode='upload')
+    
+    def _force_download(self, game):
+        """Force download cloud saves to local."""
+        if messagebox.askyesno("Force Download", f"Download cloud saves for '{game['name']}'?\n\nThis will overwrite your local saves."):
+            self._run_force_sync_window(game, mode='download')
+    
     def _sync_all(self):
         """Sync all games."""
         self._run_sync_window(None, run_game=False, sync_all=True)
@@ -1054,6 +1075,51 @@ class SaveSyncApp(tk.Tk):
             ttk.Button(win, text="Close", command=win.destroy).pack(pady=10)
         
         win.after(100, run)
+    
+    def _run_force_sync_window(self, game, mode='upload'):
+        """Open a window for forced upload or download."""
+        action = "Uploading" if mode == 'upload' else "Downloading"
+        win = tk.Toplevel(self)
+        win.title(f"{action}...")
+        win.geometry("500x300")
+        win.transient(self)
+        
+        text = scrolledtext.ScrolledText(win, state='disabled', font=('Consolas', 10))
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        def log(msg):
+            text.configure(state='normal')
+            text.insert(tk.END, msg + '\n')
+            text.see(tk.END)
+            text.configure(state='disabled')
+            win.update()
+        
+        def run():
+            try:
+                config = load_game_config(game['id'])
+                if not config:
+                    log(f"❌ Game '{game['id']}' not found.")
+                    return
+                
+                drive = get_drive()
+                log("Authentication successful.")
+                
+                folder_id = get_or_create_folder(drive, config.get('gdrive_folder', ''))
+                
+                if mode == 'upload':
+                    log(f"Force uploading saves for {game['name']}...")
+                    zip_and_upload(drive, folder_id, config, log_func=log)
+                else:
+                    log(f"Force downloading saves for {game['name']}...")
+                    download_and_extract(drive, folder_id, config, log_func=log)
+                
+                log("\n✅ Done!")
+            except Exception as e:
+                log(f"\n❌ Error: {e}")
+            
+            ttk.Button(win, text="Close", command=win.destroy).pack(pady=10)
+        
+        win.after(100, run)
 
 
 # ============================================================
@@ -1062,6 +1128,9 @@ class SaveSyncApp(tk.Tk):
 
 def run_cli_with_gui_window(game_id, sync_only=False, start_minimized=False):
     """Run CLI mode with a GUI log window and system tray support."""
+    import pystray
+    from PIL import Image
+
     root = tk.Tk()
     root.title(f"SaveSync - {game_id}")
     root.geometry("550x350")
