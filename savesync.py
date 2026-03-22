@@ -10,6 +10,7 @@ import subprocess
 import shutil
 import argparse
 import threading
+import logging
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
@@ -18,13 +19,31 @@ from datetime import datetime
 # get_drive() and run_cli_with_gui_window() for faster startup.
 
 # --- CONSTANTS ---
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_NAME = "saveSync"
 APP_DATA_DIR = Path(os.getenv('APPDATA')) / APP_NAME
 GAMES_DIR = APP_DATA_DIR / "games"
 CLIENT_SECRETS_FILE = APP_DATA_DIR / "client_secrets.json"
 CREDENTIALS_FILE = APP_DATA_DIR / "credentials.txt"
 SETTINGS_FILE = APP_DATA_DIR / "settings.json"
+DEBUG_LOG_FILE = APP_DATA_DIR / "debug.log"
+
+# --- DEBUG LOGGING SETUP ---
+def setup_debug_logging():
+    """Set up file-based debug logging."""
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger('savesync')
+    logger.setLevel(logging.DEBUG)
+    # Remove existing handlers to avoid duplicates
+    logger.handlers.clear()
+    fh = logging.FileHandler(str(DEBUG_LOG_FILE), mode='a', encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    return logger
+
+debug_log = setup_debug_logging()
 
 # Default settings
 DEFAULT_SETTINGS = {
@@ -296,12 +315,17 @@ def sync_game(game_id, run_game=True, log_func=print, conflict_callback=None):
     conflict_callback: Optional function(local_time, cloud_time) -> 'local' | 'cloud' | 'cancel'
                        If not provided, defaults to CLI prompt or auto-download.
     """
+    debug_log.info(f"sync_game called: game_id={game_id!r}, run_game={run_game}")
     config = load_game_config(game_id)
     if not config:
+        debug_log.error(f"Game config not found for game_id={game_id!r}")
         raise Exception(f"Game '{game_id}' not found.")
+    
+    debug_log.info(f"Game config loaded: {json.dumps(config, indent=2)}")
     
     drive = get_drive()
     log_func("Authentication successful.")
+    debug_log.info("Google Drive authentication successful")
     
     folder_id = get_or_create_folder(drive, config.get('gdrive_folder', ''))
     remote_zip_name = config.get('remote_zip_name', 'saves.zip')
@@ -313,6 +337,7 @@ def sync_game(game_id, run_game=True, log_func=print, conflict_callback=None):
     
     log_func(f"Local saves: {format_time(local_time)}")
     log_func(f"Cloud saves: {format_time(cloud_time)}")
+    debug_log.info(f"Local saves: {format_time(local_time)}, Cloud saves: {format_time(cloud_time)}")
     
     # Determine sync action
     should_download = True
@@ -356,8 +381,41 @@ def sync_game(game_id, run_game=True, log_func=print, conflict_callback=None):
         log_func(f"\nStarting Game: {game_exe}")
         log_func("Waiting for game to close...")
         
-        process = subprocess.Popen(game_exe)
-        process.wait()
+        debug_log.info(f"About to launch game exe: {game_exe!r}")
+        debug_log.info(f"game_exe type: {type(game_exe).__name__}")
+        debug_log.info(f"game_exe exists: {os.path.exists(game_exe)}")
+        debug_log.info(f"game_exe is file: {os.path.isfile(game_exe) if os.path.exists(game_exe) else 'N/A'}")
+        debug_log.info(f"game_exe absolute: {os.path.abspath(game_exe)}")
+        debug_log.info(f"Current working dir: {os.getcwd()}")
+        
+        # Check if exe path has forward slashes and try to normalize
+        normalized_exe = os.path.normpath(game_exe)
+        debug_log.info(f"Normalized exe path: {normalized_exe!r}")
+        debug_log.info(f"Normalized exists: {os.path.exists(normalized_exe)}")
+        
+        try:
+            game_cwd = os.path.dirname(os.path.abspath(game_exe))
+            debug_log.info(f"Calling subprocess.Popen({game_exe!r}, cwd={game_cwd!r})")
+            process = subprocess.Popen(game_exe, cwd=game_cwd)
+            debug_log.info(f"Popen returned, PID={process.pid}")
+            log_func(f"Game process started (PID: {process.pid})")
+            
+            debug_log.info("Waiting for game process to exit...")
+            exit_code = process.wait()
+            debug_log.info(f"Game process exited with code: {exit_code}")
+            log_func(f"Game exited with code: {exit_code}")
+        except FileNotFoundError as e:
+            debug_log.error(f"FileNotFoundError launching game: {e}")
+            log_func(f"\n❌ Game executable not found: {game_exe}")
+            raise
+        except OSError as e:
+            debug_log.error(f"OSError launching game: {e}")
+            log_func(f"\n❌ OS error launching game: {e}")
+            raise
+        except Exception as e:
+            debug_log.error(f"Unexpected error launching game: {type(e).__name__}: {e}")
+            log_func(f"\n❌ Error launching game: {e}")
+            raise
         
         log_func("\nGame closed. Uploading saves...")
         # Always upload after game closes
@@ -795,6 +853,99 @@ class ConflictDialog(tk.Toplevel):
         self.destroy()
 
 
+class CompareSavesDialog(tk.Toplevel):
+    """Dialog for comparing local and cloud save timestamps."""
+    
+    def __init__(self, parent, game_name, local_time, cloud_time):
+        super().__init__(parent)
+        self.title(f"Compare Saves - {game_name}")
+        self.geometry("450x260")
+        self.resizable(False, False)
+        self.result = None  # 'local', 'cloud', or None (cancel)
+        
+        self.transient(parent)
+        self.grab_set()
+        
+        self._create_widgets(game_name, local_time, cloud_time)
+        self.center_window()
+        
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+    
+    def center_window(self):
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - self.winfo_width()) // 2
+        y = (self.winfo_screenheight() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+    
+    def _create_widgets(self, game_name, local_time, cloud_time):
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(frame, text=f"Save Comparison", font=('Segoe UI', 12, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text=game_name, foreground='gray').pack(anchor='w', pady=(2, 15))
+        
+        # Determine which is newer
+        local_newer = local_time and cloud_time and local_time > cloud_time
+        cloud_newer = local_time and cloud_time and cloud_time > local_time
+        
+        info_frame = ttk.Frame(frame)
+        info_frame.pack(fill=tk.X, pady=5)
+        
+        # Local row
+        ttk.Label(info_frame, text="💾 Local saves:", font=('Segoe UI', 9, 'bold')).grid(row=0, column=0, sticky='w')
+        local_text = format_time(local_time)
+        if local_newer:
+            local_text += "  ← newer"
+        local_lbl = ttk.Label(info_frame, text=local_text)
+        if local_newer:
+            local_lbl.configure(foreground='#228B22')
+        local_lbl.grid(row=0, column=1, sticky='w', padx=10)
+        
+        # Cloud row
+        ttk.Label(info_frame, text="☁️ Cloud saves:", font=('Segoe UI', 9, 'bold')).grid(row=1, column=0, sticky='w', pady=2)
+        cloud_text = format_time(cloud_time)
+        if cloud_newer:
+            cloud_text += "  ← newer"
+        cloud_lbl = ttk.Label(info_frame, text=cloud_text)
+        if cloud_newer:
+            cloud_lbl.configure(foreground='#228B22')
+        cloud_lbl.grid(row=1, column=1, sticky='w', padx=10)
+        
+        if local_time and cloud_time and not local_newer and not cloud_newer:
+            ttk.Label(frame, text="Both saves are the same age.", foreground='gray').pack(anchor='w', pady=(10, 0))
+        
+        ttk.Label(frame, text="What would you like to do?", font=('Segoe UI', 10)).pack(anchor='w', pady=(20, 10))
+        
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        local_btn = ttk.Button(btn_frame, text="Use Local ⬆", width=15, command=self._use_local)
+        local_btn.pack(side=tk.LEFT, padx=(0, 5))
+        ToolTip(local_btn, "Upload local saves to cloud (overwrites cloud)")
+        if local_time is None:
+            local_btn.configure(state='disabled')
+        
+        cloud_btn = ttk.Button(btn_frame, text="Use Cloud ⬇", width=15, command=self._use_cloud)
+        cloud_btn.pack(side=tk.LEFT, padx=5)
+        ToolTip(cloud_btn, "Download cloud saves to local (overwrites local)")
+        if cloud_time is None:
+            cloud_btn.configure(state='disabled')
+        
+        ttk.Button(btn_frame, text="Cancel", width=10, command=self._cancel).pack(side=tk.RIGHT)
+    
+    def _use_local(self):
+        self.result = 'local'
+        self.destroy()
+    
+    def _use_cloud(self):
+        self.result = 'cloud'
+        self.destroy()
+    
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class SaveSyncApp(tk.Tk):
     """Main application window."""
     
@@ -946,15 +1097,20 @@ class SaveSyncApp(tk.Tk):
         btn_frame = ttk.Frame(row)
         btn_frame.pack(side=tk.RIGHT)
         
-        play_btn = ttk.Button(btn_frame, text="▶ Play", width=8,
+        play_btn = ttk.Button(btn_frame, text="▶", width=3,
                               command=lambda g=game: self._sync_and_play(g))
         play_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(play_btn, "Download saves, launch game, upload after closing")
         
-        sync_btn = ttk.Button(btn_frame, text="🔄 Sync", width=8,
+        sync_btn = ttk.Button(btn_frame, text="🔄", width=3,
                               command=lambda g=game: self._sync_only(g))
         sync_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(sync_btn, "Sync saves without launching game")
+
+        compare_btn = ttk.Button(btn_frame, text="⇄", width=3,
+                                  command=lambda g=game: self._compare_saves(g))
+        compare_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(compare_btn, "Compare local & cloud saves")
         
         upload_btn = ttk.Button(btn_frame, text="⬆", width=3,
                                 command=lambda g=game: self._force_upload(g))
@@ -1034,6 +1190,69 @@ class SaveSyncApp(tk.Tk):
         """Force download cloud saves to local."""
         if messagebox.askyesno("Force Download", f"Download cloud saves for '{game['name']}'?\n\nThis will overwrite your local saves."):
             self._run_force_sync_window(game, mode='download')
+    
+    def _compare_saves(self, game):
+        """Compare local and cloud save timestamps, let user choose action."""
+        win = tk.Toplevel(self)
+        win.title(f"Comparing saves - {game['name']}")
+        win.geometry("500x300")
+        win.transient(self)
+        
+        text = scrolledtext.ScrolledText(win, state='disabled', font=('Consolas', 10))
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        def log(msg):
+            text.configure(state='normal')
+            text.insert(tk.END, msg + '\n')
+            text.see(tk.END)
+            text.configure(state='disabled')
+            win.update()
+        
+        def run():
+            try:
+                config = load_game_config(game['id'])
+                if not config:
+                    log(f"❌ Game '{game['id']}' not found.")
+                    ttk.Button(win, text="Close", command=win.destroy).pack(pady=10)
+                    return
+                
+                log("Authenticating...")
+                drive = get_drive()
+                log("Authentication successful.")
+                
+                folder_id = get_or_create_folder(drive, config.get('gdrive_folder', ''))
+                remote_zip_name = config.get('remote_zip_name', 'saves.zip')
+                
+                log("Fetching save timestamps...")
+                local_time = get_local_save_time(config['local_save_dir'])
+                cloud_time, cloud_file = get_cloud_save_info(drive, folder_id, remote_zip_name)
+                
+                log(f"Local saves: {format_time(local_time)}")
+                log(f"Cloud saves: {format_time(cloud_time)}")
+                
+                # Show comparison dialog
+                dialog = CompareSavesDialog(win, game['name'], local_time, cloud_time)
+                win.wait_window(dialog)
+                
+                choice = dialog.result
+                if choice == 'local':
+                    log("\nUser chose: Use LOCAL saves (uploading to cloud)...")
+                    zip_and_upload(drive, folder_id, config, log_func=log)
+                elif choice == 'cloud':
+                    log("\nUser chose: Use CLOUD saves (downloading to local)...")
+                    download_and_extract(drive, folder_id, config, log_func=log)
+                else:
+                    log("\nCancelled.")
+                    win.destroy()
+                    return
+                
+                log("\n✅ Done!")
+            except Exception as e:
+                log(f"\n❌ Error: {e}")
+            
+            ttk.Button(win, text="Close", command=win.destroy).pack(pady=10)
+        
+        win.after(100, run)
     
     def _sync_all(self):
         """Sync all games."""
@@ -1338,23 +1557,59 @@ def cli_mode(game_id):
 # ============================================================
 
 def main():
+    debug_log.info("=" * 60)
+    debug_log.info("SaveSync starting")
+    debug_log.info(f"Version: {VERSION}")
+    debug_log.info(f"Python: {sys.version}")
+    debug_log.info(f"Executable: {sys.executable}")
+    debug_log.info(f"Frozen: {getattr(sys, 'frozen', False)}")
+    if getattr(sys, 'frozen', False):
+        debug_log.info(f"MEIPASS: {getattr(sys, '_MEIPASS', 'N/A')}")
+    debug_log.info(f"sys.argv: {sys.argv}")
+    debug_log.info(f"CWD: {os.getcwd()}")
+    debug_log.info(f"APP_DATA_DIR: {APP_DATA_DIR}")
+    
     parser = argparse.ArgumentParser(description="SaveSync - Game Save Synchronization")
     parser.add_argument('--game', '-g', help='Game ID to sync and launch (CLI mode)')
     parser.add_argument('--sync-only', action='store_true', help='Only sync, do not launch game')
     args = parser.parse_args()
     
+    debug_log.info(f"Parsed args: game={args.game!r}, sync_only={args.sync_only}")
+    
     ensure_app_dirs()
     
     if args.game:
+        debug_log.info(f"Entering CLI mode for game: {args.game!r}")
         # CLI mode - always use tray-enabled window
         # Setting controls whether window starts visible or minimized
         settings = load_settings()
         start_minimized = not settings.get('show_log_window', True)
-        run_cli_with_gui_window(args.game, sync_only=args.sync_only, start_minimized=start_minimized)
+        debug_log.info(f"Settings: show_log_window={settings.get('show_log_window')}, start_minimized={start_minimized}")
+        
+        # Validate game config exists before proceeding
+        config = load_game_config(args.game)
+        if config:
+            debug_log.info(f"Game config found: name={config.get('name')}, exe={config.get('game_exe')}")
+            game_exe = config.get('game_exe', '')
+            debug_log.info(f"Game exe exists: {os.path.exists(game_exe)}")
+            if os.path.exists(game_exe):
+                debug_log.info(f"Game exe size: {os.path.getsize(game_exe)} bytes")
+        else:
+            debug_log.error(f"Game config NOT found for id: {args.game!r}")
+            debug_log.info(f"Available game configs: {[f.stem for f in GAMES_DIR.glob('*.json')]}")
+        
+        try:
+            run_cli_with_gui_window(args.game, sync_only=args.sync_only, start_minimized=start_minimized)
+        except Exception as e:
+            debug_log.error(f"Fatal error in CLI mode: {type(e).__name__}: {e}", exc_info=True)
+            raise
     else:
+        debug_log.info("Entering GUI mode")
         # GUI mode
         app = SaveSyncApp()
         app.mainloop()
+    
+    debug_log.info("SaveSync exiting normally")
 
 
 if __name__ == "__main__":
