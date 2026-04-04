@@ -88,6 +88,29 @@ If local saves are NEWER than cloud, you'll be asked:
   - Cancel:     Abort sync
 
 -------------------------------------------
+AUTO-UPDATE
+-------------------------------------------
+SaveSync checks for updates from GitHub Releases
+on every launch (GUI and CLI/shortcut modes).
+
+GUI Mode:
+  - A green ⬆ icon appears next to the version
+    in the title bar when an update is available.
+  - Click the icon to see release notes and choose:
+    - Update Now: Downloads and installs automatically
+    - Skip This Version: Won't prompt for this version
+    - Remind Me Later: Will check again next launch
+  - You can also check manually via Settings >
+    🔄 Check for Updates
+
+CLI/Shortcut Mode:
+  - Update availability is shown in the log after
+    sync completes. Open SaveSync GUI to install.
+
+Note: Auto-update only works for the built EXE.
+When running as a Python script, updates are skipped.
+
+-------------------------------------------
 FILES
 -------------------------------------------
 savesync.py     - Main application (GUI + CLI)

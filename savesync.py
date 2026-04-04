@@ -11,15 +11,19 @@ import shutil
 import argparse
 import threading
 import logging
+import tempfile
+import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 # Heavy imports (pydrive2, pystray, PIL) are lazy-loaded inside
 # get_drive() and run_cli_with_gui_window() for faster startup.
 
 # --- CONSTANTS ---
-VERSION = "1.2.0"
+VERSION = "1.3.1"
 APP_NAME = "saveSync"
 APP_DATA_DIR = Path(os.getenv('APPDATA')) / APP_NAME
 GAMES_DIR = APP_DATA_DIR / "games"
@@ -27,6 +31,11 @@ CLIENT_SECRETS_FILE = APP_DATA_DIR / "client_secrets.json"
 CREDENTIALS_FILE = APP_DATA_DIR / "credentials.txt"
 SETTINGS_FILE = APP_DATA_DIR / "settings.json"
 DEBUG_LOG_FILE = APP_DATA_DIR / "debug.log"
+
+# --- AUTO-UPDATE ---
+GITHUB_REPO = "BernaLang/savesync"
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_DIR = APP_DATA_DIR / "update_temp"
 
 # --- DEBUG LOGGING SETUP ---
 def setup_debug_logging():
@@ -48,7 +57,8 @@ debug_log = setup_debug_logging()
 # Default settings
 DEFAULT_SETTINGS = {
     "show_log_window": True,  # Show GUI log window in CLI/shortcut mode
-    "default_gdrive_folder": ""  # Default GDrive folder path for new games
+    "default_gdrive_folder": "",  # Default GDrive folder path for new games
+    "skipped_update_version": ""  # Version the user chose to skip
 }
 
 
@@ -230,13 +240,17 @@ def get_cloud_save_info(drive, folder_id, remote_zip_name):
     
     if file_list:
         cloud_file = file_list[0]
-        # Parse the modifiedDate from Google Drive (ISO format)
+        # Parse the modifiedDate from Google Drive (UTC / ISO format)
         modified_str = cloud_file.get('modifiedDate', '')
+        debug_log.info(f"Raw cloud modifiedDate: {modified_str!r}")
         if modified_str:
-            # Format: 2024-01-25T10:30:00.000Z
+            # Format: 2024-01-25T10:30:00.000Z  (always UTC)
             try:
-                cloud_time = datetime.strptime(modified_str[:19], '%Y-%m-%dT%H:%M:%S')
-                return cloud_time, cloud_file
+                # Parse as UTC, then convert to local time for comparison
+                cloud_time_utc = datetime.strptime(modified_str[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+                cloud_time_local = cloud_time_utc.astimezone().replace(tzinfo=None)
+                debug_log.info(f"Cloud time UTC: {cloud_time_utc}, Local: {cloud_time_local}")
+                return cloud_time_local, cloud_file
             except ValueError:
                 pass
         return None, cloud_file
@@ -509,6 +523,166 @@ def create_desktop_shortcut(game_id, config):
 
 
 # ============================================================
+# AUTO-UPDATE FUNCTIONS
+# ============================================================
+
+def parse_version(version_str):
+    """Parse a version string like '1.2.3' or 'v1.2.3' into a comparable tuple."""
+    v = version_str.strip().lstrip('v')
+    parts = []
+    for part in v.split('.'):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+def check_for_update():
+    """
+    Check GitHub for a newer release.
+    Returns (new_version, download_url, release_notes) or None.
+    """
+    try:
+        req = Request(GITHUB_API_URL, headers={'User-Agent': f'SaveSync/{VERSION}'})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        
+        tag = data.get('tag_name', '')
+        remote_version = parse_version(tag)
+        local_version = parse_version(VERSION)
+        
+        if remote_version > local_version:
+            # Find the zip asset
+            download_url = None
+            for asset in data.get('assets', []):
+                name = asset.get('name', '')
+                if name.endswith('.zip'):
+                    download_url = asset.get('browser_download_url')
+                    break
+            
+            if download_url:
+                release_notes = data.get('body', '') or ''
+                new_version = tag.lstrip('v')
+                debug_log.info(f"Update available: {VERSION} -> {new_version}")
+                return new_version, download_url, release_notes
+        
+        debug_log.info(f"No update available (local={VERSION}, remote={tag})")
+        return None
+    except Exception as e:
+        debug_log.warning(f"Update check failed: {e}")
+        return None
+
+
+def download_and_apply_update(download_url, new_version, log_func=print):
+    """
+    Download the update zip, extract it, and create a batch script
+    that replaces the current exe + _internal folder after exit.
+    """
+    if not getattr(sys, 'frozen', False):
+        log_func("Auto-update is only supported for the built EXE.")
+        return False
+    
+    current_exe = Path(sys.executable)
+    current_dir = current_exe.parent
+    
+    try:
+        # Clean up any previous update attempt
+        if UPDATE_DIR.exists():
+            shutil.rmtree(UPDATE_DIR)
+        UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Download the zip
+        zip_path = UPDATE_DIR / f"SaveSync_v{new_version}.zip"
+        log_func(f"Downloading SaveSync v{new_version}...")
+        debug_log.info(f"Downloading update from {download_url}")
+        
+        req = Request(download_url, headers={'User-Agent': f'SaveSync/{VERSION}'})
+        with urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get('Content-Length', 0))
+            downloaded = 0
+            with open(zip_path, 'wb') as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = int(downloaded / total * 100)
+                        log_func(f"Downloading... {pct}%")
+        
+        log_func("Download complete. Extracting...")
+        
+        # Extract zip
+        extract_dir = UPDATE_DIR / "extracted"
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(extract_dir)
+        
+        # Find the inner folder
+        source_dir = None
+        for item in extract_dir.iterdir():
+            if item.is_dir() and (item / "SaveSync.exe").exists():
+                source_dir = item
+                break
+        
+        if source_dir is None:
+            # Maybe the exe is directly in extract_dir
+            if (extract_dir / "SaveSync.exe").exists():
+                source_dir = extract_dir
+            else:
+                log_func("❌ Could not find SaveSync.exe in the update package.")
+                debug_log.error(f"Update extraction failed: no SaveSync.exe found in {extract_dir}")
+                return False
+        
+        log_func("Preparing update...")
+        debug_log.info(f"Update source dir: {source_dir}")
+        debug_log.info(f"Current exe dir: {current_dir}")
+        
+        # Create batch script to replace files after this process exits
+        bat_path = UPDATE_DIR / "update.bat"
+        bat_content = f'''@echo off
+echo Waiting for SaveSync to close...
+:waitloop
+tasklist /FI "PID eq {os.getpid()}" 2>NUL | find "{os.getpid()}" >NUL
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >NUL
+    goto waitloop
+)
+echo Applying update...
+xcopy /E /Y /I "{source_dir}\\*" "{current_dir}\\"
+echo Update complete! Starting SaveSync...
+start "" "{current_exe}"
+echo Cleaning up...
+rd /S /Q "{UPDATE_DIR}"
+(goto) 2>nul & del "%~f0"
+'''
+        with open(bat_path, 'w') as f:
+            f.write(bat_content)
+        
+        log_func("Launching updater and restarting...")
+        debug_log.info(f"Launching update batch script: {bat_path}")
+        
+        # Launch the batch script (hidden window)
+        subprocess.Popen(
+            ['cmd', '/c', str(bat_path)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            cwd=str(UPDATE_DIR)
+        )
+        
+        # Exit the current process
+        debug_log.info("Exiting for update...")
+        sys.exit(0)
+        
+    except SystemExit:
+        raise  # Don't catch sys.exit()
+    except Exception as e:
+        log_func(f"❌ Update failed: {e}")
+        debug_log.error(f"Update failed: {e}", exc_info=True)
+        return False
+
+
+# ============================================================
 # GUI APPLICATION
 # ============================================================
 
@@ -598,6 +772,17 @@ class SettingsDialog(tk.Toplevel):
         gdrive_entry.pack(side=tk.LEFT, padx=(5, 0))
         ToolTip(gdrive_entry, "Pre-filled when adding new games (e.g., SaveSync/Games)")
         
+        # Check for Updates button
+        update_frame = ttk.Frame(settings_frame)
+        update_frame.pack(fill=tk.X, pady=(15, 0))
+        update_btn = ttk.Button(
+            update_frame, text="🔄 Check for Updates",
+            command=self._check_for_updates
+        )
+        update_btn.pack(anchor='w')
+        self._update_btn = update_btn
+        ToolTip(update_btn, f"Current version: v{VERSION}. Check GitHub for a newer release.")
+        
         ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=10)
         
         # === Google API Section ===
@@ -618,11 +803,21 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(btn_frame, text="Save", command=self._save).pack(side=tk.RIGHT)
     
+    def _check_for_updates(self):
+        """Trigger manual update check from settings dialog."""
+        # Delegate to the main app's manual check method
+        parent = self.master
+        if hasattr(parent, '_manual_check_for_update'):
+            self.destroy()
+            parent._manual_check_for_update()
+    
     def _save(self):
-        # Save app settings
+        # Save app settings (preserve skipped_update_version)
+        current = load_settings()
         settings = {
             'show_log_window': self.show_log_var.get(),
-            'default_gdrive_folder': self.default_gdrive_var.get().strip()
+            'default_gdrive_folder': self.default_gdrive_var.get().strip(),
+            'skipped_update_version': current.get('skipped_update_version', '')
         }
         save_settings(settings)
         
@@ -946,6 +1141,85 @@ class CompareSavesDialog(tk.Toplevel):
         self.destroy()
 
 
+class UpdateDialog(tk.Toplevel):
+    """Dialog shown when a new version is available."""
+    
+    def __init__(self, parent, current_version, new_version, release_notes, download_url):
+        super().__init__(parent)
+        self.title("Update Available")
+        self.geometry("480x320")
+        self.resizable(False, False)
+        self.result = None  # 'update', 'skip', or None (remind later)
+        self.download_url = download_url
+        self.new_version = new_version
+        
+        self.transient(parent)
+        self.grab_set()
+        
+        self._create_widgets(current_version, new_version, release_notes)
+        self.center_window()
+        
+        self.protocol("WM_DELETE_WINDOW", self._later)
+    
+    def center_window(self):
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - self.winfo_width()) // 2
+        y = (self.winfo_screenheight() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+    
+    def _create_widgets(self, current_version, new_version, release_notes):
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(frame, text="🔄 Update Available!", font=('Segoe UI', 13, 'bold')).pack(anchor='w')
+        
+        version_frame = ttk.Frame(frame)
+        version_frame.pack(fill=tk.X, pady=(12, 5))
+        
+        ttk.Label(version_frame, text="Current version:", font=('Segoe UI', 9, 'bold')).grid(row=0, column=0, sticky='w')
+        ttk.Label(version_frame, text=f"v{current_version}").grid(row=0, column=1, sticky='w', padx=10)
+        
+        ttk.Label(version_frame, text="New version:", font=('Segoe UI', 9, 'bold')).grid(row=1, column=0, sticky='w', pady=2)
+        ttk.Label(version_frame, text=f"v{new_version}", foreground='#228B22').grid(row=1, column=1, sticky='w', padx=10)
+        
+        if release_notes:
+            ttk.Label(frame, text="Release notes:", font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(10, 3))
+            notes_text = scrolledtext.ScrolledText(frame, height=6, width=50, font=('Segoe UI', 9), state='normal')
+            notes_text.pack(fill=tk.BOTH, expand=True)
+            notes_text.insert('1.0', release_notes)
+            notes_text.configure(state='disabled')
+        else:
+            # Add spacing if no release notes
+            ttk.Frame(frame).pack(expand=True)
+        
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=(15, 0))
+        
+        update_btn = ttk.Button(btn_frame, text="⬆ Update Now", command=self._update)
+        update_btn.pack(side=tk.LEFT, padx=(0, 5))
+        ToolTip(update_btn, "Download and install the update (app will restart)")
+        
+        skip_btn = ttk.Button(btn_frame, text="Skip This Version", command=self._skip)
+        skip_btn.pack(side=tk.LEFT, padx=5)
+        ToolTip(skip_btn, "Don't show this update again")
+        
+        later_btn = ttk.Button(btn_frame, text="Remind Me Later", command=self._later)
+        later_btn.pack(side=tk.RIGHT)
+        ToolTip(later_btn, "Ask again next time")
+    
+    def _update(self):
+        self.result = 'update'
+        self.destroy()
+    
+    def _skip(self):
+        self.result = 'skip'
+        self.destroy()
+    
+    def _later(self):
+        self.result = None
+        self.destroy()
+
+
 class SaveSyncApp(tk.Tk):
     """Main application window."""
     
@@ -956,6 +1230,9 @@ class SaveSyncApp(tk.Tk):
         self.geometry("600x450")
         self.minsize(500, 350)
         
+        # Update state
+        self._update_info = None  # (new_version, download_url, release_notes)
+        
         # Set window icon
         self._set_icon()
         
@@ -964,6 +1241,9 @@ class SaveSyncApp(tk.Tk):
         self._check_client_secrets()
         self._refresh_games()
         self.center_window()
+        
+        # Check for updates in background (2s delay so GUI loads first)
+        self.after(2000, self._check_for_update_bg)
     
     def center_window(self):
         self.update_idletasks()
@@ -993,6 +1273,7 @@ class SaveSyncApp(tk.Tk):
         style = ttk.Style()
         style.configure('Title.TLabel', font=('Segoe UI', 14, 'bold'))
         style.configure('Game.TFrame', padding=10)
+        style.configure('GameBtn.TButton', font=('Segoe UI Emoji', 10), padding=(4, 2))
     
     def _create_widgets(self):
         # Main container
@@ -1003,7 +1284,7 @@ class SaveSyncApp(tk.Tk):
         header = ttk.Frame(main)
         header.pack(fill=tk.X, pady=(0, 15))
         
-        ttk.Label(header, text=f"🎮 SaveSync v{VERSION}", style='Title.TLabel').pack(side=tk.LEFT)
+        ttk.Label(header, text="🎮 SaveSync", style='Title.TLabel').pack(side=tk.LEFT)
         ttk.Button(header, text="⚙ Settings", command=self._show_settings).pack(side=tk.RIGHT)
         
         # Games list frame
@@ -1040,6 +1321,21 @@ class SaveSyncApp(tk.Tk):
         sync_all_btn = ttk.Button(btn_frame, text="🔄 Sync All", command=self._sync_all)
         sync_all_btn.pack(side=tk.LEFT, padx=10)
         ToolTip(sync_all_btn, "Sync all games without launching")
+        
+        # Version + update indicator (bottom right)
+        version_frame = ttk.Frame(btn_frame)
+        version_frame.pack(side=tk.RIGHT)
+        
+        # Update indicator (hidden by default, shown when update is available)
+        self._update_label = tk.Label(
+            version_frame, text="⬆", font=('Segoe UI', 10, 'bold'),
+            fg='#228B22', cursor='hand2'
+        )
+        self._update_label.bind('<Button-1>', lambda e: self._show_update_dialog())
+        # Don't pack yet — shown only when update is detected
+        
+        ttk.Label(version_frame, text=f"v{VERSION}", foreground='gray',
+                  font=('Segoe UI', 9)).pack(side=tk.RIGHT)
     
     def _on_canvas_configure(self, event):
         """Update games_frame width when canvas is resized."""
@@ -1062,6 +1358,114 @@ class SaveSyncApp(tk.Tk):
         
         if dialog.result:
             messagebox.showinfo("Success", "Settings saved successfully!")
+    
+    def _check_for_update_bg(self):
+        """Check for updates in a background thread (non-blocking)."""
+        def _check():
+            result = check_for_update()
+            if result:
+                self._update_info = result
+                # Schedule UI update on the main thread
+                self.after(0, self._on_update_found)
+        
+        thread = threading.Thread(target=_check, daemon=True)
+        thread.start()
+    
+    def _on_update_found(self):
+        """Called on main thread when an update is found."""
+        if not self._update_info:
+            return
+        new_version, download_url, release_notes = self._update_info
+        
+        # Check if user has skipped this version
+        settings = load_settings()
+        if settings.get('skipped_update_version', '') == new_version:
+            debug_log.info(f"Update v{new_version} was skipped by user.")
+            return
+        
+        # Show the update indicator icon (packs to left of version text)
+        self._update_label.pack(side=tk.RIGHT, padx=(0, 5))
+        ToolTip(self._update_label, f"Update available: v{new_version} (click to update)")
+    
+    def _show_update_dialog(self):
+        """Show the update dialog."""
+        if not self._update_info:
+            return
+        new_version, download_url, release_notes = self._update_info
+        
+        dialog = UpdateDialog(self, VERSION, new_version, release_notes, download_url)
+        self.wait_window(dialog)
+        
+        if dialog.result == 'update':
+            self._perform_update(download_url, new_version)
+        elif dialog.result == 'skip':
+            settings = load_settings()
+            settings['skipped_update_version'] = new_version
+            save_settings(settings)
+            # Hide the update indicator
+            self._update_label.pack_forget()
+            debug_log.info(f"User skipped update v{new_version}")
+    
+    def _perform_update(self, download_url, new_version):
+        """Run the update with a progress window."""
+        win = tk.Toplevel(self)
+        win.title("Updating SaveSync...")
+        win.geometry("500x300")
+        win.transient(self)
+        win.grab_set()
+        
+        text = scrolledtext.ScrolledText(win, state='disabled', font=('Consolas', 10))
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        def log(msg):
+            text.configure(state='normal')
+            text.insert(tk.END, msg + '\n')
+            text.see(tk.END)
+            text.configure(state='disabled')
+            win.update()
+        
+        def run():
+            download_and_apply_update(download_url, new_version, log_func=log)
+            # If we get here, the update failed (sys.exit didn't happen)
+            ttk.Button(win, text="Close", command=win.destroy).pack(pady=10)
+        
+        win.after(100, run)
+    
+    def _manual_check_for_update(self):
+        """Manually trigger an update check (from Settings)."""
+        self._update_info = None
+        
+        win = tk.Toplevel(self)
+        win.title("Checking for updates...")
+        win.geometry("400x150")
+        win.transient(self)
+        win.grab_set()
+        
+        frame = ttk.Frame(win, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        status_label = ttk.Label(frame, text="Checking for updates...", font=('Segoe UI', 10))
+        status_label.pack(pady=(10, 15))
+        
+        def _check():
+            result = check_for_update()
+            if result:
+                self._update_info = result
+                new_version = result[0]
+                self.after(0, lambda: [
+                    status_label.configure(text=f"Update available: v{new_version}"),
+                    self._on_update_found(),
+                    win.destroy(),
+                    self._show_update_dialog()
+                ])
+            else:
+                self.after(0, lambda: [
+                    status_label.configure(text="✅ You're running the latest version!"),
+                    ttk.Button(frame, text="OK", command=win.destroy).pack(pady=5)
+                ])
+        
+        thread = threading.Thread(target=_check, daemon=True)
+        thread.start()
     
     def _refresh_games(self):
         """Refresh the games list."""
@@ -1097,42 +1501,42 @@ class SaveSyncApp(tk.Tk):
         btn_frame = ttk.Frame(row)
         btn_frame.pack(side=tk.RIGHT)
         
-        play_btn = ttk.Button(btn_frame, text="▶", width=3,
+        play_btn = ttk.Button(btn_frame, text="▶️", width=4, style='GameBtn.TButton',
                               command=lambda g=game: self._sync_and_play(g))
         play_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(play_btn, "Download saves, launch game, upload after closing")
         
-        sync_btn = ttk.Button(btn_frame, text="🔄", width=3,
-                              command=lambda g=game: self._sync_only(g))
-        sync_btn.pack(side=tk.LEFT, padx=2)
-        ToolTip(sync_btn, "Sync saves without launching game")
+        #sync_btn = ttk.Button(btn_frame, text="🔄", width=4, style='GameBtn.TButton',
+        #                      command=lambda g=game: self._sync_only(g))
+        #sync_btn.pack(side=tk.LEFT, padx=2)
+        #ToolTip(sync_btn, "Sync saves without launching game")
 
-        compare_btn = ttk.Button(btn_frame, text="⇄", width=3,
+        compare_btn = ttk.Button(btn_frame, text="🔀", width=4, style='GameBtn.TButton',
                                   command=lambda g=game: self._compare_saves(g))
         compare_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(compare_btn, "Compare local & cloud saves")
         
-        upload_btn = ttk.Button(btn_frame, text="⬆", width=3,
+        upload_btn = ttk.Button(btn_frame, text="⬆️", width=4, style='GameBtn.TButton',
                                 command=lambda g=game: self._force_upload(g))
         upload_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(upload_btn, "Force upload local saves to cloud")
         
-        download_btn = ttk.Button(btn_frame, text="⬇", width=3,
+        download_btn = ttk.Button(btn_frame, text="⬇️", width=4, style='GameBtn.TButton',
                                   command=lambda g=game: self._force_download(g))
         download_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(download_btn, "Force download cloud saves to local")
         
-        edit_btn = ttk.Button(btn_frame, text="✏", width=3,
+        edit_btn = ttk.Button(btn_frame, text="✏️", width=4, style='GameBtn.TButton',
                               command=lambda g=game: self._edit_game(g))
         edit_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(edit_btn, "Edit game configuration")
         
-        shortcut_btn = ttk.Button(btn_frame, text="🔗", width=3,
+        shortcut_btn = ttk.Button(btn_frame, text="🔗", width=4, style='GameBtn.TButton',
                                   command=lambda g=game: self._create_shortcut(g))
         shortcut_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(shortcut_btn, "Create desktop shortcut")
         
-        delete_btn = ttk.Button(btn_frame, text="🗑", width=3,
+        delete_btn = ttk.Button(btn_frame, text="🗑️", width=4, style='GameBtn.TButton',
                                 command=lambda g=game: self._delete_game(g))
         delete_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(delete_btn, "Remove game from SaveSync")
@@ -1511,6 +1915,16 @@ def run_cli_with_gui_window(game_id, sync_only=False, start_minimized=False):
                 thread_safe_log("\n✅ Done!")
         except Exception as e:
             thread_safe_log(f"\n❌ Error: {e}")
+        
+        # Check for updates (CLI/shortcut mode - log only)
+        try:
+            update_result = check_for_update()
+            if update_result:
+                new_ver = update_result[0]
+                thread_safe_log(f"\n🔄 Update available: v{VERSION} → v{new_ver}")
+                thread_safe_log("   Open SaveSync to update.")
+        except Exception:
+            pass  # Don't fail on update check errors
         
         sync_complete = True
         # Add close button after sync completes (on main thread)
