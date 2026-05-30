@@ -23,7 +23,7 @@ from urllib.error import URLError
 # get_drive() and run_cli_with_gui_window() for faster startup.
 
 # --- CONSTANTS ---
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 APP_NAME = "saveSync"
 APP_DATA_DIR = Path(os.getenv('APPDATA')) / APP_NAME
 GAMES_DIR = APP_DATA_DIR / "games"
@@ -58,7 +58,8 @@ debug_log = setup_debug_logging()
 DEFAULT_SETTINGS = {
     "show_log_window": True,  # Show GUI log window in CLI/shortcut mode
     "default_gdrive_folder": "",  # Default GDrive folder path for new games
-    "skipped_update_version": ""  # Version the user chose to skip
+    "skipped_update_version": "",  # Version the user chose to skip
+    "device_gamelist_sv_path": ""  # GDrive path to save gamelist JSON (e.g., SaveSync/device1.json)
 }
 
 
@@ -484,6 +485,64 @@ def sync_all_games(log_func=print, conflict_callback=None):
             log_func(f"Error syncing {game['name']}: {e}")
 
 
+def upload_gamelist_to_gdrive(log_func=print):
+    """Upload the full games list JSON to Google Drive at the configured path."""
+    settings = load_settings()
+    sv_path = settings.get('device_gamelist_sv_path', '').strip()
+    if not sv_path:
+        return
+
+    debug_log.info(f"Uploading gamelist to GDrive path: {sv_path}")
+
+    try:
+        drive = get_drive()
+
+        # Split into folder path and filename
+        normalized = sv_path.replace('\\', '/').strip('/')
+        if '/' in normalized:
+            folder_path = normalized.rsplit('/', 1)[0]
+            filename = normalized.rsplit('/', 1)[1]
+        else:
+            folder_path = ''
+            filename = normalized
+
+        # Collect all game configs
+        games = list_games()
+        gamelist_data = []
+        for game in games:
+            gamelist_data.append({
+                'id': game.get('id', ''),
+                'name': game.get('name', ''),
+                'local_save_dir': game.get('local_save_dir', ''),
+                'game_exe': game.get('game_exe', ''),
+                'gdrive_folder': game.get('gdrive_folder', ''),
+                'remote_zip_name': game.get('remote_zip_name', '')
+            })
+
+        json_content = json.dumps(gamelist_data, indent=2)
+
+        # Get or create the folder on GDrive
+        folder_id = get_or_create_folder(drive, folder_path)
+
+        # Check if file already exists
+        query = f"title = '{filename}' and '{folder_id}' in parents and trashed = false"
+        file_list = drive.ListFile({'q': query}).GetList()
+
+        if file_list:
+            f = file_list[0]
+        else:
+            f = drive.CreateFile({'title': filename, 'parents': [{'id': folder_id}]})
+
+        f.SetContentString(json_content)
+        f.Upload()
+
+        log_func(f"Gamelist saved to GDrive: {sv_path}")
+        debug_log.info(f"Gamelist uploaded successfully to {sv_path}")
+    except Exception as e:
+        log_func(f"\u26a0\ufe0f Failed to upload gamelist: {e}")
+        debug_log.error(f"Gamelist upload failed: {e}", exc_info=True)
+
+
 def create_desktop_shortcut(game_id, config):
     """Create a desktop shortcut for the game."""
     try:
@@ -725,7 +784,7 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("520x450")
+        self.geometry("520x500")
         self.resizable(False, False)
         self.result = None
         
@@ -772,6 +831,15 @@ class SettingsDialog(tk.Toplevel):
         gdrive_entry.pack(side=tk.LEFT, padx=(5, 0))
         ToolTip(gdrive_entry, "Pre-filled when adding new games (e.g., SaveSync/Games)")
         
+        # Device Gamelist SV Path
+        gamelist_frame = ttk.Frame(settings_frame)
+        gamelist_frame.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(gamelist_frame, text="Device Gamelist SV Path:").pack(side=tk.LEFT)
+        self.gamelist_sv_var = tk.StringVar(value=current_settings.get('device_gamelist_sv_path', ''))
+        gamelist_entry = ttk.Entry(gamelist_frame, textvariable=self.gamelist_sv_var, width=30)
+        gamelist_entry.pack(side=tk.LEFT, padx=(5, 0))
+        ToolTip(gamelist_entry, "GDrive path to save the games list config (must end in .json, e.g., SaveSync/my_device.json)")
+        
         # Check for Updates button
         update_frame = ttk.Frame(settings_frame)
         update_frame.pack(fill=tk.X, pady=(15, 0))
@@ -812,12 +880,19 @@ class SettingsDialog(tk.Toplevel):
             parent._manual_check_for_update()
     
     def _save(self):
+        # Validate device gamelist sv path
+        gamelist_path = self.gamelist_sv_var.get().strip()
+        if gamelist_path and not gamelist_path.lower().endswith('.json'):
+            messagebox.showerror("Invalid Path", "Device Gamelist SV Path must end with .json")
+            return
+        
         # Save app settings (preserve skipped_update_version)
         current = load_settings()
         settings = {
             'show_log_window': self.show_log_var.get(),
             'default_gdrive_folder': self.default_gdrive_var.get().strip(),
-            'skipped_update_version': current.get('skipped_update_version', '')
+            'skipped_update_version': current.get('skipped_update_version', ''),
+            'device_gamelist_sv_path': gamelist_path
         }
         save_settings(settings)
         
@@ -1341,6 +1416,16 @@ class SaveSyncApp(tk.Tk):
         """Update games_frame width when canvas is resized."""
         self.canvas.itemconfig(self.canvas_window, width=event.width)
     
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scrolling on the games list canvas."""
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    
+    def _bind_mousewheel_recursive(self, widget):
+        """Bind mousewheel event to a widget and all its descendants."""
+        widget.bind("<MouseWheel>", self._on_mousewheel)
+        for child in widget.winfo_children():
+            self._bind_mousewheel_recursive(child)
+    
     def _check_client_secrets(self):
         """Check if client secrets are configured, prompt if not."""
         if not load_client_secrets():
@@ -1484,6 +1569,9 @@ class SaveSyncApp(tk.Tk):
         
         for game in games:
             self._create_game_row(game)
+        
+        # Bind mousewheel scrolling to canvas and all child widgets
+        self._bind_mousewheel_recursive(self.canvas)
     
     def _create_game_row(self, game):
         """Create a row for a game in the list."""
@@ -1543,6 +1631,18 @@ class SaveSyncApp(tk.Tk):
         
         ttk.Separator(self.games_frame, orient='horizontal').pack(fill=tk.X, pady=5)
     
+    def _upload_gamelist_bg(self):
+        """Upload gamelist to GDrive in background thread (if configured)."""
+        settings = load_settings()
+        if not settings.get('device_gamelist_sv_path', '').strip():
+            return
+        
+        def _upload():
+            upload_gamelist_to_gdrive(log_func=lambda msg: debug_log.info(msg))
+        
+        thread = threading.Thread(target=_upload, daemon=True)
+        thread.start()
+    
     def _add_game(self):
         """Add a new game."""
         dialog = GameConfigDialog(self)
@@ -1552,6 +1652,7 @@ class SaveSyncApp(tk.Tk):
             game_id = dialog.result.pop('id')
             save_game_config(game_id, dialog.result)
             self._refresh_games()
+            self._upload_gamelist_bg()
     
     def _edit_game(self, game):
         """Edit an existing game."""
@@ -1562,12 +1663,14 @@ class SaveSyncApp(tk.Tk):
             game_id = dialog.result.pop('id')
             save_game_config(game_id, dialog.result)
             self._refresh_games()
+            self._upload_gamelist_bg()
     
     def _delete_game(self, game):
         """Delete a game configuration."""
         if messagebox.askyesno("Confirm Delete", f"Delete '{game['name']}' from SaveSync?\n\n(This won't delete your save files)"):
             delete_game_config(game['id'])
             self._refresh_games()
+            self._upload_gamelist_bg()
     
     def _create_shortcut(self, game):
         """Create a desktop shortcut for the game."""

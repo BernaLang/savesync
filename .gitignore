@@ -10,6 +10,7 @@ __pycache__/
 .eggs/
 _local/
 .env
+__*.py
 
 # PyInstaller
 build/
