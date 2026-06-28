@@ -18,7 +18,7 @@ Download saves before playing, upload after closing.
 REQUIREMENTS
 -------------------------------------------
 - Python 3.10+
-- Dependencies: pip install pydrive2 winshell pywin32
+- Dependencies: pip install pydrive2 winshell pywin32 OR pip install -r requirements.txt
 
 -------------------------------------------
 HOW TO RUN (Development)

@@ -21,11 +21,12 @@ from pathlib import Path
 from datetime import datetime, timezone
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+from urllib.parse import quote
 # Heavy imports (pydrive2, pystray, PIL) are lazy-loaded inside
 # get_drive() and run_cli_with_gui_window() for faster startup.
 
 # --- CONSTANTS ---
-VERSION = "1.4.0"
+VERSION = "1.4.2"
 APP_NAME = "saveSync"
 APP_DATA_DIR = Path(os.getenv('APPDATA')) / APP_NAME
 GAMES_DIR = APP_DATA_DIR / "games"
@@ -1031,16 +1032,218 @@ class SettingsDialog(tk.Toplevel):
         self.destroy()
 
 
+# ============================================================
+# PCGAMINGWIKI AUTOCOMPLETE
+# ============================================================
+
+# Mapping of PCGamingWiki {{p|...}} path variables to Windows equivalents
+_PCGW_PATH_MAP = {
+    'appdata':              os.environ.get('APPDATA', ''),
+    'localappdata':         os.environ.get('LOCALAPPDATA', ''),
+    'userprofile':          os.environ.get('USERPROFILE', ''),
+    'userprofile\\documents': os.path.join(os.environ.get('USERPROFILE', ''), 'Documents'),
+    'userprofile/documents': os.path.join(os.environ.get('USERPROFILE', ''), 'Documents'),
+    'userprofile\\appdata\\locallow': os.path.join(os.environ.get('USERPROFILE', ''), 'AppData', 'LocalLow'),
+    'userprofile/appdata/locallow': os.path.join(os.environ.get('USERPROFILE', ''), 'AppData', 'LocalLow'),
+    'userprofile\\appdata\\roaming': os.environ.get('APPDATA', ''),
+    'userprofile/appdata/roaming': os.environ.get('APPDATA', ''),
+    'userprofile\\appdata\\local': os.environ.get('LOCALAPPDATA', ''),
+    'userprofile/appdata/local': os.environ.get('LOCALAPPDATA', ''),
+    'userprofile\\saved games': os.path.join(os.environ.get('USERPROFILE', ''), 'Saved Games'),
+    'userprofile/saved games': os.path.join(os.environ.get('USERPROFILE', ''), 'Saved Games'),
+    'public':               os.environ.get('PUBLIC', ''),
+    'programdata':          os.environ.get('PROGRAMDATA', ''),
+    'programfiles':         os.environ.get('PROGRAMFILES', ''),
+    'programfiles(x86)':    os.environ.get('PROGRAMFILES(X86)', ''),
+    'windir':               os.environ.get('WINDIR', ''),
+    'username':             os.environ.get('USERNAME', ''),
+}
+
+_PCGW_API_BASE = 'https://www.pcgamingwiki.com/w/api.php'
+
+
+def _pcgw_api_request(params):
+    """Make a GET request to the PCGamingWiki MediaWiki API."""
+    query = '&'.join(f"{k}={quote(str(v))}" for k, v in params.items())
+    url = f"{_PCGW_API_BASE}?{query}"
+    req = Request(url, headers={'User-Agent': f'SaveSync/{VERSION}'})
+    with urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
+def pcgw_search_game(query):
+    """
+    Search PCGamingWiki for games matching the query string.
+    Returns a list of page titles.
+    """
+    try:
+        data = _pcgw_api_request({
+            'action': 'opensearch',
+            'search': query,
+            'limit': '10',
+            'format': 'json',
+        })
+        # OpenSearch returns: [query, [titles], [descriptions], [urls]]
+        if isinstance(data, list) and len(data) >= 2:
+            return data[1]
+        return []
+    except Exception as e:
+        debug_log.warning(f"PCGamingWiki search failed: {e}")
+        return []
+
+
+def _pcgw_resolve_path(wiki_path):
+    """
+    Resolve a PCGamingWiki wikitext path to a real Windows path.
+    Handles {{p|appdata}}, {{p|userprofile}}, {{p|uid}} etc.
+    """
+    def _replace_var(match):
+        var_name = match.group(1).strip().lower()
+        if var_name == 'uid':
+            return '<steamid>'
+        if var_name == 'steam':
+            return _detect_steam_path()
+        return _PCGW_PATH_MAP.get(var_name, match.group(0))
+
+    resolved = re.sub(r'\{\{p\|([^}]+)\}\}', _replace_var, wiki_path, flags=re.IGNORECASE)
+    # Normalize slashes
+    resolved = resolved.replace('/', '\\')
+    # Remove trailing backslash
+    resolved = resolved.rstrip('\\')
+    return resolved
+
+
+def _detect_steam_path():
+    """Try to detect the Steam installation path from the registry or common locations."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam')
+        steam_path, _ = winreg.QueryValueEx(key, 'SteamPath')
+        winreg.CloseKey(key)
+        return str(Path(steam_path))
+    except Exception:
+        pass
+    # Fallback to common paths
+    for candidate in [
+        Path(os.environ.get('PROGRAMFILES(X86)', '')) / 'Steam',
+        Path(os.environ.get('PROGRAMFILES', '')) / 'Steam',
+        Path('C:/Program Files (x86)/Steam'),
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    return '<steam>'
+
+
+def pcgw_get_save_path(page_title):
+    """
+    Fetch the Windows save game path for a game from PCGamingWiki.
+    Returns the resolved path string, or None if not found.
+    """
+    try:
+        # Step 1: Get page sections to find "Save game data location"
+        sections_data = _pcgw_api_request({
+            'action': 'parse',
+            'page': page_title,
+            'prop': 'sections',
+            'format': 'json',
+        })
+
+        sections = sections_data.get('parse', {}).get('sections', [])
+        save_section_index = None
+        for section in sections:
+            if section.get('line', '').lower().strip() == 'save game data location':
+                save_section_index = section.get('index')
+                break
+
+        if save_section_index is None:
+            debug_log.info(f"No 'Save game data location' section found for {page_title}")
+            return None
+
+        # Step 2: Fetch that section's wikitext
+        wikitext_data = _pcgw_api_request({
+            'action': 'parse',
+            'page': page_title,
+            'prop': 'wikitext',
+            'section': save_section_index,
+            'format': 'json',
+        })
+
+        wikitext = wikitext_data.get('parse', {}).get('wikitext', {}).get('*', '')
+        if not wikitext:
+            return None
+
+        # Step 3: Parse Windows save paths from {{Game data/saves|Windows|...}}
+        # The template contains nested {{p|...}} so we can't use a simple regex.
+        # Instead, find the start marker and then manually balance braces.
+        marker = '{{Game data/saves|Windows|'
+        marker_lower = marker.lower()
+        wikitext_lower = wikitext.lower()
+        start = wikitext_lower.find(marker_lower)
+        if start == -1:
+            return None
+
+        # Position right after the marker (start of the paths content)
+        content_start = start + len(marker)
+        # Walk forward balancing {{ and }} to find the matching closing }}
+        depth = 2  # We're inside {{Game data/saves and {{Game data|
+        pos = content_start
+        while pos < len(wikitext) - 1:
+            if wikitext[pos:pos+2] == '{{':
+                depth += 1
+                pos += 2
+            elif wikitext[pos:pos+2] == '}}':
+                depth -= 1
+                if depth <= 1:  # Back to the {{Game data| level
+                    break
+                pos += 2
+            else:
+                pos += 1
+
+        paths_raw = wikitext[content_start:pos]
+        # Split by | (but not inside nested {{...}}) - simple split works
+        # because {{p|...}} inner | is inside braces.
+        # We need to split only on top-level pipes.
+        paths = []
+        current = []
+        brace_depth = 0
+        for ch in paths_raw:
+            if ch == '{':
+                brace_depth += 1
+                current.append(ch)
+            elif ch == '}':
+                brace_depth -= 1
+                current.append(ch)
+            elif ch == '|' and brace_depth == 0:
+                paths.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            paths.append(''.join(current).strip())
+        paths = [p for p in paths if p]
+
+        if not paths:
+            return None
+
+        # Use the first path and resolve wiki variables
+        return _pcgw_resolve_path(paths[0])
+
+    except Exception as e:
+        debug_log.warning(f"PCGamingWiki save path lookup failed for {page_title}: {e}")
+        return None
+
+
 class GameConfigDialog(tk.Toplevel):
     """Dialog to add/edit a game configuration."""
     
     def __init__(self, parent, config=None):
         super().__init__(parent)
         self.title("Add Game" if config is None else "Edit Game")
-        self.geometry("550x320")
+        self.geometry("550x360")
         self.resizable(False, False)
         self.result = None
         self.config = config or {}
+        self._pcgw_thread = None  # Track background lookup thread
         
         self.transient(parent)
         self.grab_set()
@@ -1058,22 +1261,22 @@ class GameConfigDialog(tk.Toplevel):
         frame = ttk.Frame(self, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
         
+        # Game Executable
+        ttk.Label(frame, text="Game Executable:").grid(row=0, column=0, sticky='w', pady=5)
+        self.exe_var = tk.StringVar(value=self.config.get('game_exe', ''))
+        ttk.Entry(frame, textvariable=self.exe_var, width=40).grid(row=0, column=1, sticky='w', pady=5)
+        ttk.Button(frame, text="Browse...", command=self._browse_exe).grid(row=0, column=2, padx=5)
+        
         # Game Name
-        ttk.Label(frame, text="Game Name:").grid(row=0, column=0, sticky='w', pady=5)
+        ttk.Label(frame, text="Game Name:").grid(row=1, column=0, sticky='w', pady=5)
         self.name_var = tk.StringVar(value=self.config.get('name', ''))
-        ttk.Entry(frame, textvariable=self.name_var, width=50).grid(row=0, column=1, columnspan=2, sticky='w', pady=5)
+        ttk.Entry(frame, textvariable=self.name_var, width=50).grid(row=1, column=1, columnspan=2, sticky='w', pady=5)
         
         # Local Save Directory
-        ttk.Label(frame, text="Save Directory:").grid(row=1, column=0, sticky='w', pady=5)
+        ttk.Label(frame, text="Save Directory:").grid(row=2, column=0, sticky='w', pady=5)
         self.save_dir_var = tk.StringVar(value=self.config.get('local_save_dir', ''))
-        ttk.Entry(frame, textvariable=self.save_dir_var, width=40).grid(row=1, column=1, sticky='w', pady=5)
-        ttk.Button(frame, text="Browse...", command=self._browse_save_dir).grid(row=1, column=2, padx=5)
-        
-        # Game Executable
-        ttk.Label(frame, text="Game Executable:").grid(row=2, column=0, sticky='w', pady=5)
-        self.exe_var = tk.StringVar(value=self.config.get('game_exe', ''))
-        ttk.Entry(frame, textvariable=self.exe_var, width=40).grid(row=2, column=1, sticky='w', pady=5)
-        ttk.Button(frame, text="Browse...", command=self._browse_exe).grid(row=2, column=2, padx=5)
+        ttk.Entry(frame, textvariable=self.save_dir_var, width=40).grid(row=2, column=1, sticky='w', pady=5)
+        ttk.Button(frame, text="Browse...", command=self._browse_save_dir).grid(row=2, column=2, padx=5)
         
         # Google Drive Folder - pre-fill with default for new games
         ttk.Label(frame, text="GDrive Folder:").grid(row=3, column=0, sticky='w', pady=5)
@@ -1090,15 +1293,25 @@ class GameConfigDialog(tk.Toplevel):
         self.zip_var = tk.StringVar(value=self.config.get('remote_zip_name', ''))
         ttk.Entry(frame, textvariable=self.zip_var, width=50).grid(row=5, column=1, columnspan=2, sticky='w', pady=5)
         
+        # PCGamingWiki lookup status label
+        self._status_var = tk.StringVar(value='')
+        self._status_label = ttk.Label(frame, textvariable=self._status_var, foreground='gray', font=('Segoe UI', 8))
+        self._status_label.grid(row=6, column=0, columnspan=3, sticky='w', pady=(5, 0))
+        
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=6, column=0, columnspan=3, pady=(20, 0), sticky='e')
+        btn_frame.grid(row=7, column=0, columnspan=3, pady=(15, 0), sticky='e')
         
         ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(btn_frame, text="Save", command=self._save).pack(side=tk.RIGHT)
     
     def _browse_save_dir(self):
-        path = filedialog.askdirectory(title="Select Save Directory")
+        # Start the dialog at the current save dir path if it exists
+        initial = self.save_dir_var.get().strip()
+        kwargs = {'title': 'Select Save Directory'}
+        if initial and os.path.isdir(initial):
+            kwargs['initialdir'] = initial
+        path = filedialog.askdirectory(**kwargs)
         if path:
             self.save_dir_var.set(path)
     
@@ -1115,7 +1328,58 @@ class GameConfigDialog(tk.Toplevel):
                 self.name_var.set(name)
             if not self.zip_var.get():
                 self.zip_var.set(f"{Path(path).stem.lower()}.zip")
+            # Trigger PCGamingWiki lookup in background
+            self._pcgw_lookup(Path(path).stem)
     
+    def _pcgw_lookup(self, exe_stem):
+        """Look up game info from PCGamingWiki in a background thread."""
+        # Build a search query from the exe stem:
+        # 1. Replace underscores/dashes with spaces
+        # 2. Split camelCase (e.g. "NovaRoma" -> "Nova Roma")
+        search_query = exe_stem.replace('_', ' ').replace('-', ' ')
+        search_query = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', search_query)
+        search_query = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', search_query)
+
+        self._status_var.set('🔍 Looking up on PCGamingWiki...')
+        self._status_label.configure(foreground='gray')
+
+        def _do_lookup():
+            try:
+                results = pcgw_search_game(search_query)
+                if not results:
+                    self.after(0, lambda: self._pcgw_on_result(None, None))
+                    return
+
+                page_title = results[0]
+                save_path = pcgw_get_save_path(page_title)
+                self.after(0, lambda pt=page_title, sp=save_path: self._pcgw_on_result(pt, sp))
+            except Exception as e:
+                debug_log.warning(f"PCGamingWiki lookup error: {e}")
+                self.after(0, lambda: self._pcgw_on_result(None, None))
+
+        self._pcgw_thread = threading.Thread(target=_do_lookup, daemon=True)
+        self._pcgw_thread.start()
+
+    def _pcgw_on_result(self, page_title, save_path):
+        """Handle PCGamingWiki lookup result on the main thread."""
+        if page_title:
+            self.name_var.set(page_title)
+            # Also update zip filename to match
+            game_id = page_title.lower().replace(' ', '_').replace('-', '_')
+            game_id = ''.join(c for c in game_id if c.isalnum() or c == '_')
+            self.zip_var.set(f"{game_id}.zip")
+
+            if save_path:
+                self.save_dir_var.set(save_path)
+                self._status_var.set(f'✅ Found: {page_title}')
+                self._status_label.configure(foreground='#228B22')
+            else:
+                self._status_var.set(f'✅ Found: {page_title}  (save path not available)')
+                self._status_label.configure(foreground='#B8860B')
+        else:
+            self._status_var.set('⚠️ Game not found on PCGamingWiki')
+            self._status_label.configure(foreground='#CC6600')
+
     def _save(self):
         name = self.name_var.get().strip()
         save_dir = self.save_dir_var.get().strip()

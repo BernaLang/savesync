@@ -1,0 +1,6 @@
+pydrive2
+pystray
+Pillow
+winshell
+pywin32
+pyinstaller
