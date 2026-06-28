@@ -13,6 +13,8 @@ import threading
 import logging
 import tempfile
 import re
+import time
+import ssl
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
@@ -265,6 +267,53 @@ def format_time(dt):
     return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 
+def _is_transient_error(exc):
+    """Check if an exception is a transient network/SSL error worth retrying."""
+    transient_phrases = [
+        'eof occurred',
+        'ssl',
+        'connection reset',
+        'connection aborted',
+        'broken pipe',
+        'timed out',
+        'timeout',
+        'connection refused',
+        'temporary failure',
+        'name resolution',
+    ]
+    msg = str(exc).lower()
+    if any(phrase in msg for phrase in transient_phrases):
+        return True
+    if isinstance(exc, (ssl.SSLError, ConnectionError, TimeoutError, OSError)):
+        return True
+    return False
+
+
+def _retry_drive_op(operation, max_retries=3, log_func=print, op_name="operation"):
+    """
+    Retry a Google Drive operation with exponential backoff on transient errors.
+    
+    operation: callable that performs the drive operation.
+    Returns the result of operation() on success.
+    Raises the last exception if all retries are exhausted.
+    """
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return operation()
+        except Exception as e:
+            last_exc = e
+            if _is_transient_error(e) and attempt < max_retries:
+                wait = 2 ** attempt  # 2s, 4s, 8s
+                log_func(f"⚠️ {op_name} failed (attempt {attempt}/{max_retries}): {e}")
+                log_func(f"   Retrying in {wait}s...")
+                debug_log.warning(f"{op_name} attempt {attempt} failed: {e}. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+    raise last_exc
+
+
 def download_and_extract(drive, folder_id, config, log_func=print):
     """Download saves from Google Drive and extract to local directory."""
     log_func("Checking Google Drive for cloud saves...")
@@ -277,7 +326,11 @@ def download_and_extract(drive, folder_id, config, log_func=print):
     
     if file_list:
         log_func("Cloud save found. Downloading...")
-        file_list[0].GetContentFile(str(temp_zip))
+        _retry_drive_op(
+            lambda: file_list[0].GetContentFile(str(temp_zip)),
+            log_func=log_func,
+            op_name="Download"
+        )
         
         if os.path.exists(local_save_dir):
             shutil.rmtree(local_save_dir)
@@ -316,19 +369,55 @@ def zip_and_upload(drive, folder_id, config, log_func=print):
         f = drive.CreateFile({'title': remote_zip_name, 'parents': [{'id': folder_id}]})
     
     f.SetContentFile(str(temp_zip))
-    f.Upload()
-    f.content = None
+
+    def _do_upload():
+        f.Upload()
+        f.content = None
+
+    _retry_drive_op(_do_upload, log_func=log_func, op_name="Upload")
     
     temp_zip.unlink()
     log_func("Sync Successful! Cloud is up to date.")
 
 
-def sync_game(game_id, run_game=True, log_func=print, conflict_callback=None):
+def _sync_op_with_error_retry(operation, error_callback, log_func=print, op_name="Sync"):
+    """
+    Run a sync operation, and if it fails, invoke error_callback to ask the user
+    whether to retry or cancel. Loops until success or the user cancels.
+    
+    operation: callable that performs the sync operation.
+    error_callback: Optional function(error_message, op_name) -> 'retry' | 'cancel'
+                    If None, the error is raised immediately.
+    """
+    while True:
+        try:
+            operation()
+            return  # Success
+        except Exception as e:
+            debug_log.error(f"{op_name} failed: {type(e).__name__}: {e}", exc_info=True)
+            if error_callback:
+                log_func(f"\n❌ {op_name} error: {e}")
+                choice = error_callback(str(e), op_name)
+                if choice == 'retry':
+                    log_func(f"Retrying {op_name.lower()}...")
+                    debug_log.info(f"User chose to retry {op_name}")
+                    continue
+                else:
+                    log_func(f"{op_name} cancelled by user.")
+                    debug_log.info(f"User cancelled {op_name} after error")
+                    return
+            else:
+                raise
+
+
+def sync_game(game_id, run_game=True, log_func=print, conflict_callback=None, error_callback=None):
     """
     Sync a game's saves and optionally run the game.
     
     conflict_callback: Optional function(local_time, cloud_time) -> 'local' | 'cloud' | 'cancel'
                        If not provided, defaults to CLI prompt or auto-download.
+    error_callback: Optional function(error_message, op_name) -> 'retry' | 'cancel'
+                    If provided, sync errors show a retry dialog instead of raising.
     """
     debug_log.info(f"sync_game called: game_id={game_id!r}, run_game={run_game}")
     config = load_game_config(game_id)
@@ -389,7 +478,10 @@ def sync_game(game_id, run_game=True, log_func=print, conflict_callback=None):
     
     # Download from cloud (if needed)
     if should_download and cloud_file:
-        download_and_extract(drive, folder_id, config, log_func)
+        _sync_op_with_error_retry(
+            lambda: download_and_extract(drive, folder_id, config, log_func),
+            error_callback, log_func, op_name="Download"
+        )
     
     if run_game:
         game_exe = config['game_exe']
@@ -433,12 +525,26 @@ def sync_game(game_id, run_game=True, log_func=print, conflict_callback=None):
             raise
         
         log_func("\nGame closed. Uploading saves...")
+        # Re-authenticate to get a fresh connection - the old one may have
+        # gone stale during the game session (causes SSL EOF errors).
+        try:
+            drive = get_drive()
+            folder_id = get_or_create_folder(drive, config.get('gdrive_folder', ''))
+            debug_log.info("Re-authenticated Google Drive for post-game upload")
+        except Exception as e:
+            debug_log.warning(f"Re-auth failed, using existing connection: {e}")
         # Always upload after game closes
-        zip_and_upload(drive, folder_id, config, log_func)
+        _sync_op_with_error_retry(
+            lambda: zip_and_upload(drive, folder_id, config, log_func),
+            error_callback, log_func, op_name="Upload"
+        )
     else:
         # Sync-only mode: upload only if we didn't download (local is newer or no cloud saves)
         if not should_download:
-            zip_and_upload(drive, folder_id, config, log_func)
+            _sync_op_with_error_retry(
+                lambda: zip_and_upload(drive, folder_id, config, log_func),
+                error_callback, log_func, op_name="Upload"
+            )
         else:
             log_func("Downloaded cloud saves - no upload needed.")
     return True
@@ -470,7 +576,7 @@ def cli_conflict_prompt(local_time, cloud_time):
             print("Invalid choice. Please enter 1, 2, or 3.")
 
 
-def sync_all_games(log_func=print, conflict_callback=None):
+def sync_all_games(log_func=print, conflict_callback=None, error_callback=None):
     """Sync all configured games (download and upload only, no game launch)."""
     games = list_games()
     if not games:
@@ -480,7 +586,7 @@ def sync_all_games(log_func=print, conflict_callback=None):
     for game in games:
         log_func(f"\n=== Syncing: {game['name']} ===")
         try:
-            sync_game(game['id'], run_game=False, log_func=log_func, conflict_callback=conflict_callback)
+            sync_game(game['id'], run_game=False, log_func=log_func, conflict_callback=conflict_callback, error_callback=error_callback)
         except Exception as e:
             log_func(f"Error syncing {game['name']}: {e}")
 
@@ -1116,6 +1222,75 @@ class ConflictDialog(tk.Toplevel):
     
     def _use_cloud(self):
         self.result = 'cloud'
+        self.destroy()
+    
+    def _cancel(self):
+        self.result = 'cancel'
+        self.destroy()
+
+
+class ErrorRetryDialog(tk.Toplevel):
+    """Dialog shown when a sync error occurs, offering Retry or Cancel."""
+    
+    def __init__(self, parent, error_message, operation_name="Sync"):
+        super().__init__(parent)
+        self.title("Sync Error")
+        self.geometry("480x220")
+        self.resizable(False, False)
+        self.result = None  # 'retry' or 'cancel'
+        
+        self.transient(parent)
+        self.grab_set()
+        
+        self._create_widgets(error_message, operation_name)
+        self.center_window()
+        
+        # Handle window close button
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+    
+    def center_window(self):
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - self.winfo_width()) // 2
+        y = (self.winfo_screenheight() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+    
+    def _create_widgets(self, error_message, operation_name):
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Error icon and title
+        ttk.Label(frame, text=f"❌ {operation_name} Failed", font=('Segoe UI', 12, 'bold')).pack(anchor='w')
+        
+        # Error message
+        ttk.Label(
+            frame,
+            text=str(error_message),
+            wraplength=430,
+            foreground='#cc0000'
+        ).pack(anchor='w', pady=(10, 5))
+        
+        ttk.Label(
+            frame,
+            text="Would you like to retry?",
+            font=('Segoe UI', 10)
+        ).pack(anchor='w', pady=(15, 10))
+        
+        # Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Button(
+            btn_frame, text="Retry", width=15,
+            command=self._retry
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        
+        ttk.Button(
+            btn_frame, text="Cancel", width=15,
+            command=self._cancel
+        ).pack(side=tk.LEFT, padx=5)
+    
+    def _retry(self):
+        self.result = 'retry'
         self.destroy()
     
     def _cancel(self):
@@ -1788,12 +1963,18 @@ class SaveSyncApp(tk.Tk):
             win.wait_window(dialog)
             return dialog.result or 'cancel'
         
+        def gui_error_callback(error_message, op_name):
+            """GUI callback for error retry."""
+            dialog = ErrorRetryDialog(win, error_message, op_name)
+            win.wait_window(dialog)
+            return dialog.result or 'cancel'
+        
         def run():
             try:
                 if sync_all:
-                    sync_all_games(log_func=log, conflict_callback=gui_conflict_callback)
+                    sync_all_games(log_func=log, conflict_callback=gui_conflict_callback, error_callback=gui_error_callback)
                 else:
-                    sync_game(game_id, run_game=run_game, log_func=log, conflict_callback=gui_conflict_callback)
+                    sync_game(game_id, run_game=run_game, log_func=log, conflict_callback=gui_conflict_callback, error_callback=gui_error_callback)
                 log("\n✅ Done!")
             except Exception as e:
                 log(f"\n❌ Error: {e}")
@@ -1820,6 +2001,12 @@ class SaveSyncApp(tk.Tk):
             text.configure(state='disabled')
             win.update()
         
+        def gui_error_callback(error_message, op_name):
+            """GUI callback for error retry."""
+            dialog = ErrorRetryDialog(win, error_message, op_name)
+            win.wait_window(dialog)
+            return dialog.result or 'cancel'
+        
         def run():
             try:
                 config = load_game_config(game['id'])
@@ -1834,10 +2021,16 @@ class SaveSyncApp(tk.Tk):
                 
                 if mode == 'upload':
                     log(f"Force uploading saves for {game['name']}...")
-                    zip_and_upload(drive, folder_id, config, log_func=log)
+                    _sync_op_with_error_retry(
+                        lambda: zip_and_upload(drive, folder_id, config, log_func=log),
+                        gui_error_callback, log, op_name="Upload"
+                    )
                 else:
                     log(f"Force downloading saves for {game['name']}...")
-                    download_and_extract(drive, folder_id, config, log_func=log)
+                    _sync_op_with_error_retry(
+                        lambda: download_and_extract(drive, folder_id, config, log_func=log),
+                        gui_error_callback, log, op_name="Download"
+                    )
                 
                 log("\n✅ Done!")
             except Exception as e:
@@ -1977,8 +2170,14 @@ def run_cli_with_gui_window(game_id, sync_only=False, start_minimized=False):
     conflict_result = [None]  # Use list to allow modification from nested function
     conflict_data = [None, None]  # local_time, cloud_time
     
-    def check_conflict_request():
-        """Check if background thread needs conflict dialog (runs on main thread)."""
+    # Thread-safe variables for error retry dialog
+    error_event = threading.Event()
+    error_result = [None]  # 'retry' or 'cancel'
+    error_data = [None, None]  # error_message, op_name
+    
+    def check_dialog_requests():
+        """Check if background thread needs a dialog (runs on main thread)."""
+        # Check for conflict dialog request
         if conflict_data[0] is not None:
             local_time, cloud_time = conflict_data
             conflict_data[0] = None
@@ -1991,9 +2190,22 @@ def run_cli_with_gui_window(game_id, sync_only=False, start_minimized=False):
             conflict_result[0] = dialog.result or 'cancel'
             conflict_event.set()
         
+        # Check for error retry dialog request
+        if error_data[0] is not None:
+            err_msg, op_name = error_data
+            error_data[0] = None
+            error_data[1] = None
+            
+            # Make sure window is visible for error dialog
+            show_window()
+            dialog = ErrorRetryDialog(root, err_msg, op_name)
+            root.wait_window(dialog)
+            error_result[0] = dialog.result or 'cancel'
+            error_event.set()
+        
         # Keep checking while sync is running
         if not sync_complete:
-            root.after(100, check_conflict_request)
+            root.after(100, check_dialog_requests)
     
     def gui_conflict_callback(local_time, cloud_time):
         """GUI callback for conflict resolution (called from background thread)."""
@@ -2004,6 +2216,15 @@ def run_cli_with_gui_window(game_id, sync_only=False, start_minimized=False):
         conflict_event.wait()
         return conflict_result[0]
     
+    def gui_error_callback(error_message, op_name):
+        """GUI callback for error retry (called from background thread)."""
+        error_event.clear()
+        error_data[0] = error_message
+        error_data[1] = op_name
+        # Wait for main thread to handle the dialog
+        error_event.wait()
+        return error_result[0]
+    
     def thread_safe_log(msg):
         """Log message in a thread-safe way."""
         root.after(0, lambda: log(msg))
@@ -2013,7 +2234,7 @@ def run_cli_with_gui_window(game_id, sync_only=False, start_minimized=False):
         try:
             thread_safe_log(f"SaveSync - Syncing: {game_id}")
             thread_safe_log("=" * 40)
-            result = sync_game(game_id, run_game=not sync_only, log_func=thread_safe_log, conflict_callback=gui_conflict_callback)
+            result = sync_game(game_id, run_game=not sync_only, log_func=thread_safe_log, conflict_callback=gui_conflict_callback, error_callback=gui_error_callback)
             if result:
                 thread_safe_log("\n✅ Done!")
         except Exception as e:
@@ -2040,8 +2261,8 @@ def run_cli_with_gui_window(game_id, sync_only=False, start_minimized=False):
     if start_minimized:
         root.withdraw()
     
-    # Start conflict dialog checker
-    root.after(100, check_conflict_request)
+    # Start dialog checker (handles both conflict and error dialogs)
+    root.after(100, check_dialog_requests)
     
     # Run sync in background thread
     sync_thread = threading.Thread(target=run_sync, daemon=True)
