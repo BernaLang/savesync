@@ -35,7 +35,6 @@ HOW TO BUILD EXE
 
 2. Build the executable:
    pyinstaller savesync.spec --noconfirm
-   WSL: python3.exe -m PyInstaller ./savesync.spec
 
 3. Find EXE in: dist\SaveSync_v<version>.exe
 
