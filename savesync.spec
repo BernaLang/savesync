@@ -20,6 +20,8 @@ a = Analysis(
         'oauth2client.tools',
         'httplib2',
         'googleapiclient',
+        'pystray',
+        'pystray._win32',
         'winshell',
         'win32com',
         'win32com.client',
